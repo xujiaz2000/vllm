@@ -30,6 +30,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+from vllm.model_executor.models.interfaces import supports_pp_token_shards
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     copy_pp_buffers,
@@ -64,6 +65,7 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         config=None,
         topk_indices_buffer: torch.Tensor | None = None,
         index_group_builder: SparseMLAIndexGroupBuilder | None = None,
+        use_sequence_parallel: bool | None = None,
     ) -> None:
         super().__init__()
 
@@ -77,10 +79,12 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         layer_idx = int(prefix.split(sep=".")[-1])
         self.layer_idx = layer_idx
         self.use_mha = False
-        self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
-        )
+        if use_sequence_parallel is None:
+            use_sequence_parallel = (
+                parallel_config.use_sequence_parallel_moe
+                and parallel_config.pipeline_parallel_size == 1
+            )
+        self.use_sequence_parallel = use_sequence_parallel
 
         self.self_attn = DeepseekV32Attention(
             vllm_config=vllm_config,
@@ -183,9 +187,14 @@ class DeepseekV32Model(torch.nn.Module):
 
         self.vocab_size = config.vocab_size
         parallel_config = vllm_config.parallel_config
-        self.use_sequence_parallel = (
-            parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
+        use_pp_token_shards = supports_pp_token_shards(vllm_config)
+        self.use_sequence_parallel = parallel_config.use_sequence_parallel_moe and (
+            parallel_config.pipeline_parallel_size == 1 or use_pp_token_shards
+        )
+        self.pp_token_shard_keys = (
+            ("hidden_states",)
+            if self.use_sequence_parallel and use_pp_token_shards
+            else ()
         )
         # DSA is always sparse (has index_topk); allocate the shared top-k
         # buffer the indexer writes and the sparse MLA backend reads.
@@ -222,6 +231,7 @@ class DeepseekV32Model(torch.nn.Module):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 index_group_builder=index_group_builder,
+                use_sequence_parallel=self.use_sequence_parallel,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -251,7 +261,8 @@ class DeepseekV32Model(torch.nn.Module):
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         attn_in = None
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             elif self.replicated_embed:
@@ -280,11 +291,13 @@ class DeepseekV32Model(torch.nn.Module):
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
                 forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
+                    forward_context.is_padding,
+                    hidden_states if pp_group.is_first_rank else positions,
                 )
-            hidden_states = sp_shard(hidden_states)
-            if attn_in is not None:
-                attn_in = sp_shard(attn_in)
+            if pp_group.is_first_rank:
+                hidden_states = sp_shard(hidden_states)
+                if attn_in is not None:
+                    attn_in = sp_shard(attn_in)
 
         aux_hidden_states = []
         for idx, layer in enumerate(
@@ -298,15 +311,13 @@ class DeepseekV32Model(torch.nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
             attn_in = None
 
-        if not get_pp_group().is_last_rank:
-            assert not self.use_sequence_parallel, (
-                "Currently, SP is not supported with PP"
-            )
-            # PP send/recv needs TP-replicated tensors; reduce the partial sum.
-            hidden_states = residual + tensor_model_parallel_all_reduce(hidden_states)
+        if not pp_group.is_last_rank:
+            # The residual stream is already TP-complete on each token shard.
+            if not self.use_sequence_parallel:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
             return IntermediateTensors(
                 {
-                    "hidden_states": hidden_states,
+                    "hidden_states": residual + hidden_states,
                     **{k: v[:full_num_tokens] for k, v in self.pp_buffers.items()},
                 }
             )
@@ -451,6 +462,10 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         if self.config.model_type == "glm_moe_dsa":
             enable_glm52_low_latency_gemm(self, vllm_config.model_config.dtype)
+
+    @property
+    def pp_token_shard_keys(self) -> tuple[str, ...]:
+        return self.model.pp_token_shard_keys
 
     def set_moe_parameters(self):
         # Same as the base, but keyed on the MoE block type rather than the

@@ -805,7 +805,15 @@ class _MakeEmptyIntermediateTensors(Protocol):
 
 @runtime_checkable
 class SupportsPP(Protocol):
-    """The interface required for all models that support pipeline parallel."""
+    """The interface required for all models that support pipeline parallel.
+
+    Models can opt in to direct PP transport of token shards by exposing
+    `pp_token_shard_keys`, a tuple of tensor keys with the same contiguous
+    token partition on both sides of a PP edge. These tensors have
+    `ceil(num_tokens / tp_size)` rows, where both stages use the same padded
+    batch size. Models should opt in only when `supports_pp_token_shards`
+    allows it. Other keys use the existing PP transport and buffer layout.
+    """
 
     supports_pp: ClassVar[Literal[True]] = True
     """
@@ -833,6 +841,18 @@ class SupportsPP(Protocol):
         for the last PP rank.
         """
         ...
+
+
+def supports_pp_token_shards(vllm_config: "VllmConfig") -> bool:
+    """Whether the runner can preserve the model's PP token layout."""
+    parallel = vllm_config.parallel_config
+    return (
+        parallel.pipeline_parallel_size > 1
+        and parallel.tensor_parallel_size > 1
+        and not parallel.use_ubatching
+        and parallel.prefill_context_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+    )
 
 
 # We can't use runtime_checkable with ClassVar for issubclass checks

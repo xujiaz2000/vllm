@@ -74,6 +74,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsPP,
     SupportsQuant,
     SupportsReplaySSM,
+    supports_pp_token_shards,
 )
 from vllm.model_executor.models.kimi_k25 import KimiK25MediaPixelInputs
 from vllm.model_executor.models.kimi_k25_vit import (
@@ -173,6 +174,20 @@ def can_shard_sequence_parallel_shared_expert(vllm_config: VllmConfig) -> bool:
     return (
         vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         or vllm_config.parallel_config.all2all_backend == "deepep_v2"
+    )
+
+
+def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
+    return (
+        parallel_config.enable_expert_parallel
+        and parallel_config.tensor_parallel_size > 1
+        and (use_mega_moe or parallel_config.data_parallel_size > 1)
+        and (
+            parallel_config.pipeline_parallel_size == 1
+            or supports_pp_token_shards(vllm_config)
+        )
     )
 
 
@@ -706,7 +721,6 @@ class KimiDecoderLayer(nn.Module):
         layer_idx = self.layer_idx
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        parallel_config = vllm_config.parallel_config
         self.is_moe_layer = (
             self.is_moe
             and config.num_experts is not None
@@ -714,13 +728,7 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % config.moe_layer_freq == 0
         )
 
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
             assert kda_config is not None
@@ -992,13 +1000,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.attn_res_block_size: int | None = config.attn_res_block_size
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
-        use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
-        )
+        self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
         self.vocab_size = config.vocab_size
 
@@ -1202,7 +1204,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -1219,19 +1222,17 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
                 forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
+                    forward_context.is_padding,
+                    hidden_states if pp_group.is_first_rank else positions,
                 )
-            hidden_states = sp_shard(hidden_states)
-            assert residual is None, "Currently, SP is not supported with PP"
+            if pp_group.is_first_rank:
+                hidden_states = sp_shard(hidden_states)
 
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
 
         # sharded aux hidden states when sp is enabled
         aux_hidden_states: list[torch.Tensor] = []
-        if (
-            get_pp_group().is_first_rank
-            and self.start_layer in self.aux_hidden_state_layers
-        ):
+        if pp_group.is_first_rank and self.start_layer in self.aux_hidden_state_layers:
             if self.use_attn_res or residual is None:
                 aux_hidden_states.append(hidden_states)
             else:
@@ -1275,12 +1276,14 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
         assert hidden_states is not None
         assert residual is not None
-        if not get_pp_group().is_last_rank:
-            assert not self.use_sequence_parallel, (
-                "Currently, SP is not supported with PP"
-            )
+        if not pp_group.is_last_rank:
             if prefix_sum is not None:
                 hidden_states = hidden_states + prefix_sum
+            if self.use_sequence_parallel:
+                aux_hidden_states = [
+                    sp_all_gather(state)[:full_num_tokens]
+                    for state in aux_hidden_states
+                ]
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,
@@ -1518,6 +1521,12 @@ class KimiLinearForCausalLM(
         self.quant_config = quant_config
         self.model = KimiLinearModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self.pp_token_shard_keys = (
+            ("hidden_states", "residual")
+            if self.model.use_sequence_parallel
+            and supports_pp_token_shards(vllm_config)
+            else ()
         )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1793,6 +1802,9 @@ class KimiK3ForConditionalGeneration(
             )
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
+        )
+        self.pp_token_shard_keys = getattr(
+            self.language_model, "pp_token_shard_keys", ()
         )
         self.media_placeholder: int = self.config.media_placeholder_token_id
 

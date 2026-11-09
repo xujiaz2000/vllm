@@ -1450,11 +1450,16 @@ class Worker(WorkerBase):
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
-        if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                )
+        pp_group = get_pp_group()
+        all_gather_tensors = None
+        if forward_pass and pp_group.world_size > 1:
+            shard_keys = getattr(self.get_model(), "pp_token_shard_keys", ())
+            if shard_keys:
+                all_gather_tensors = dict.fromkeys(shard_keys, False)
+        if forward_pass and not pp_group.is_first_rank:
+            tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict(
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
             )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
@@ -1478,15 +1483,22 @@ class Worker(WorkerBase):
         parallel_config = self.vllm_config.parallel_config
         assert (
             parallel_config.distributed_executor_backend != "external_launcher"
-            and not get_pp_group().is_last_rank
+            and not pp_group.is_last_rank
         )
 
         # Non-blocking send of the intermediate tensors. The metadata handle
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
+        tensors = output.tensors
+        if all_gather_tensors:
+            tensors = {
+                key: tensor.contiguous() if key in all_gather_tensors else tensor
+                for key, tensor in tensors.items()
+            }
+        handles = pp_group.isend_tensor_dict(
+            tensors,
             all_gather_group=get_tp_group(),
+            all_gather_tensors=all_gather_tensors,
         )
         self._pp_send_work = handles[1:]
 

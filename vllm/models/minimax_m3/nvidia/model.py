@@ -95,6 +95,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsEagle3,
     SupportsMultiModal,
     SupportsPP,
+    supports_pp_token_shards,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -1423,6 +1424,11 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         self.config = config
         self.use_mega_moe = _use_mega_moe(vllm_config)
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        self.pp_token_shard_keys = (
+            ("hidden_states", "residual")
+            if self.use_sequence_parallel and supports_pp_token_shards(vllm_config)
+            else ()
+        )
         run_gemm_rs = _maybe_init_gemm_rs(vllm_config, self.use_sequence_parallel)
 
         self.vocab_size = config.vocab_size
@@ -1544,7 +1550,8 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -1555,7 +1562,9 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        num_tokens = hidden_states.shape[0]
+        sharded_input = not pp_group.is_first_rank and bool(self.pp_token_shard_keys)
+        full_token_tensor = positions if sharded_input else hidden_states
+        num_tokens = full_token_tensor.shape[0]
         forward_context = None
         if self.use_sequence_parallel:
             # MegaMoE reads the padding mask from the forward context; give it
@@ -1565,11 +1574,12 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 is_padding = forward_context.is_padding
                 forward_context.is_padding = sp_padding_mask(
                     is_padding[:num_tokens] if is_padding is not None else None,
-                    hidden_states,
+                    full_token_tensor,
                 )
-            hidden_states = sp_shard(hidden_states)
-            if residual is not None:
-                residual = sp_shard(residual)
+            if not sharded_input:
+                hidden_states = sp_shard(hidden_states)
+                if residual is not None:
+                    residual = sp_shard(residual)
 
         remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
 
@@ -1584,7 +1594,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             hidden_states, residual = layer.forward_input_norm(hidden_states, residual)
             # A later PP stage's start boundary is captured by the stage before.
             if idx in self.aux_hidden_state_layers and (
-                idx > self.start_layer or get_pp_group().is_first_rank
+                idx > self.start_layer or pp_group.is_first_rank
             ):
                 aux_hidden_states.append(residual.clone())
             hidden_states, residual = layer.forward_after_input_norm(
@@ -1593,12 +1603,24 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         if forward_context is not None:
             forward_context.is_padding = is_padding
 
-        if not get_pp_group().is_last_rank:
+        if not pp_group.is_last_rank:
             # Under PP every FFN reduces its own output: no all-reduce is pending.
             self._maybe_add_hidden_state(
                 aux_hidden_states, self.end_layer, hidden_states, residual
             )
-            if self.use_sequence_parallel:
+            if self.pp_token_shard_keys:
+                if aux_hidden_states:
+                    packed = torch.cat(aux_hidden_states, dim=-1)
+                    packed = sp_all_gather(packed)[:num_tokens]
+                    aux_hidden_states = list(packed.split(hidden_states.shape[-1], -1))
+                # Match the padding from the original gather, trim and shard.
+                shard_rows = hidden_states.shape[0]
+                rank_start = get_tensor_model_parallel_rank() * shard_rows
+                valid_rows = max(0, num_tokens - rank_start)
+                if valid_rows < shard_rows:
+                    hidden_states[valid_rows:].zero_()
+                    residual[valid_rows:].zero_()
+            elif self.use_sequence_parallel:
                 # PP transport expects tensors replicated across TP ranks.
                 hidden_size = hidden_states.shape[-1]
                 packed = torch.cat([hidden_states, residual, *aux_hidden_states], -1)
@@ -1781,6 +1803,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         self.model = MiniMaxM3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.pp_token_shard_keys = self.model.pp_token_shard_keys
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -1898,6 +1921,7 @@ class MiniMaxM3SparseForConditionalGeneration(
             prefix=maybe_prefix(prefix, "language_model"),
             architectures=["MiniMaxM3SparseForCausalLM"],
         )
+        self.pp_token_shard_keys = self.language_model.pp_token_shard_keys
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )

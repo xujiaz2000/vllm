@@ -9,6 +9,7 @@ import torch
 from torch import nn
 from transformers import Qwen3NextConfig
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
@@ -18,6 +19,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.kernels.triton.fused_sigmoid_gate_mul import fused_sigmoid_gate_mul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -64,6 +66,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.models.common.ops.sequence_parallel import sp_padding_mask
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
@@ -76,6 +79,7 @@ from .interfaces import (
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+    supports_pp_token_shards,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -97,11 +101,24 @@ def _should_use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
     return (
         parallel_config.use_sequence_parallel_moe
-        and parallel_config.pipeline_parallel_size == 1
+        and (
+            parallel_config.pipeline_parallel_size == 1
+            or (
+                supports_pp_token_shards(vllm_config)
+                and vllm_config.speculative_config is None
+            )
+        )
         and getattr(config, "num_experts", 0) > 0
         and not getattr(config, "mlp_only_layers", [])
         and getattr(config, "decoder_sparse_step", 1) == 1
     )
+
+
+def _shard_pp_moe_padding(positions: torch.Tensor) -> None:
+    if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+        context = get_forward_context()
+        token_positions = positions if positions.ndim == 1 else positions[0]
+        context.is_padding = sp_padding_mask(context.is_padding, token_positions)
 
 
 def _should_replicate_misaligned_shared_expert(
@@ -720,6 +737,10 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
     def use_sequence_parallel(self) -> bool:
         return self.layers[self.start_layer].use_attn_reduce_scatter_for_moe
 
+    @property
+    def pp_token_shard_keys(self) -> tuple[str, ...]:
+        return ("hidden_states", "residual") if self.use_sequence_parallel else ()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -727,21 +748,23 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1 and self.use_sequence_parallel:
+            _shard_pp_moe_padding(positions)
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            if self.use_sequence_parallel:
+                hidden_states = sequence_parallel_chunk(hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
         full_num_tokens = positions.shape[-1]
-        if self.use_sequence_parallel:
-            hidden_states = sequence_parallel_chunk(hidden_states)
-            assert residual is None
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
@@ -757,7 +780,7 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
                 aux_hidden_states, layer_idx + 1, hidden_states, residual
             )
 
-        if not get_pp_group().is_last_rank:
+        if not pp_group.is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -885,6 +908,10 @@ class Qwen3NextForCausalLM(
 
         # Set MoE hyperparameters
         self.set_moe_parameters()
+
+    @property
+    def pp_token_shard_keys(self) -> tuple[str, ...]:
+        return self.model.pp_token_shard_keys
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)

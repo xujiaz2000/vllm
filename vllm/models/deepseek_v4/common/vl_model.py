@@ -181,6 +181,9 @@ class DeepseekV4ForConditionalGeneration(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
+        self.pp_token_shard_keys = getattr(
+            self.language_model, "pp_token_shard_keys", ()
+        )
 
         self.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(
             text_mapper, image_enabled

@@ -73,6 +73,7 @@ from .interfaces import (
     SupportsMRoPE,
     SupportsPP,
     _require_is_multimodal,
+    supports_pp_token_shards,
 )
 from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from .qwen3_next import (
@@ -140,7 +141,13 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         is_moe_layer = config.model_type == "qwen3_5_moe_text"
         self.use_attn_reduce_scatter_for_moe = (
             parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
+            and (
+                parallel_config.pipeline_parallel_size == 1
+                or (
+                    supports_pp_token_shards(vllm_config)
+                    and vllm_config.speculative_config is None
+                )
+            )
             and is_moe_layer
         )
 
@@ -358,6 +365,10 @@ class Qwen3_5ForCausalLMBase(
             self.model.make_empty_intermediate_tensors
         )
 
+    @property
+    def pp_token_shard_keys(self) -> tuple[str, ...]:
+        return self.model.pp_token_shard_keys
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
@@ -525,6 +536,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
+
+    @property
+    def pp_token_shard_keys(self) -> tuple[str, ...]:
+        return self.language_model.pp_token_shard_keys
 
     def embed_input_ids(
         self,

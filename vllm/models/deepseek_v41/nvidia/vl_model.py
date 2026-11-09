@@ -198,6 +198,7 @@ class DeepseekV41ForCausalLM(
         self.make_empty_intermediate_tensors = (  # type: ignore[method-assign]
             self.language_model.make_empty_intermediate_tensors
         )
+        self.pp_token_shard_keys = self.language_model.pp_token_shard_keys
 
         expert_dtype = getattr(config, "expert_dtype", "fp4")
         self.hf_to_vllm_mapper = _make_deepseek_v4_vl_weights_mapper(

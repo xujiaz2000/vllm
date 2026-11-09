@@ -14,6 +14,7 @@ from vllm.config.kernel import MEGA_MOE_BACKENDS, NATIVE_MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -58,6 +59,7 @@ from vllm.model_executor.models.interfaces import (
     SupportsEagle3,
     SupportsLoRA,
     SupportsPP,
+    supports_pp_token_shards,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -573,10 +575,9 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
 def _use_sequence_parallel(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
     use_mega_moe = vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
-    # SP from DP alone is not validated with PP.
-    dp_sp = (
-        parallel_config.data_parallel_size > 1
-        and parallel_config.pipeline_parallel_size == 1
+    dp_sp = parallel_config.data_parallel_size > 1 and (
+        parallel_config.pipeline_parallel_size == 1
+        or supports_pp_token_shards(vllm_config)
     )
     return (
         parallel_config.enable_expert_parallel
@@ -836,6 +837,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS
         )
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
+        self.pp_token_shard_keys = (
+            ("hidden_states",)
+            if self.use_sequence_parallel and supports_pp_token_shards(vllm_config)
+            else ()
+        )
         if (
             self.use_native_mega_moe
             and not vllm_config.parallel_config.enable_expert_parallel
@@ -964,7 +970,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -981,9 +988,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
                 forward_context = get_forward_context()
                 forward_context.is_padding = sp_padding_mask(
-                    forward_context.is_padding, hidden_states
+                    forward_context.is_padding,
+                    positions if self.pp_token_shard_keys else hidden_states,
                 )
-            hidden_states = sp_shard(hidden_states)
+            if pp_group.is_first_rank or not self.pp_token_shard_keys:
+                hidden_states = sp_shard(hidden_states)
             input_ids = sp_shard(input_ids)
 
         mega_gate_metadata = None
@@ -1033,10 +1042,19 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     hidden_states, residual, post_mix, res_mix
                 )
 
-        if self.use_sequence_parallel:
+        if self.use_sequence_parallel and (
+            pp_group.is_last_rank or not self.pp_token_shard_keys
+        ):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
-        if not get_pp_group().is_last_rank:
+        if not pp_group.is_last_rank:
+            if self.pp_token_shard_keys:
+                # Match the padding from the original gather, trim and shard.
+                shard_rows = hidden_states.shape[0]
+                rank_start = get_tensor_model_parallel_rank() * shard_rows
+                valid_rows = max(0, full_num_tokens - rank_start)
+                if valid_rows < shard_rows:
+                    hidden_states[valid_rows:].zero_()
             return IntermediateTensors(
                 {
                     "hidden_states": hidden_states,
@@ -1351,6 +1369,8 @@ class DeepseekV4ForCausalLM(
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.pp_token_shard_keys = self.model.pp_token_shard_keys
+        self.requires_raw_input_tokens = bool(self.pp_token_shard_keys)
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,

@@ -35,7 +35,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 
-from .interfaces import EagleModelMixin
+from .interfaces import EagleModelMixin, supports_pp_token_shards
 from .interns2_preview import (
     InternS2PreviewForConditionalGeneration,
     InternS2PreviewProcessingInfo,
@@ -47,7 +47,7 @@ from .qwen3_5 import (
     Qwen3_5RMSNorm,
 )
 from .qwen3_5_mtp import Qwen3_5MoeMTP
-from .qwen3_next import Qwen3NextAttention
+from .qwen3_next import Qwen3NextAttention, _shard_pp_moe_padding
 from .qwen3_vl import (
     Qwen3_VisionTransformer,
     Qwen3VLDummyInputsBuilder,
@@ -188,7 +188,13 @@ class InternS2MobiusDecoderLayer(nn.Module):
         self.num_blocks = config.num_blocks
         self.use_attn_reduce_scatter_for_moe = (
             parallel_config.use_sequence_parallel_moe
-            and parallel_config.pipeline_parallel_size == 1
+            and (
+                parallel_config.pipeline_parallel_size == 1
+                or (
+                    supports_pp_token_shards(vllm_config)
+                    and vllm_config.speculative_config is None
+                )
+            )
         )
 
         if self.layer_type == "linear_attention":
@@ -342,6 +348,10 @@ class InternS2MobiusModel(nn.Module, EagleModelMixin):
     def use_sequence_parallel(self) -> bool:
         return self.layers[self.start_layer].use_attn_reduce_scatter_for_moe
 
+    @property
+    def pp_token_shard_keys(self) -> tuple[str, ...]:
+        return ("hidden_states", "residual") if self.use_sequence_parallel else ()
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -349,22 +359,24 @@ class InternS2MobiusModel(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        if get_pp_group().is_first_rank:
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1 and self.use_sequence_parallel:
+            _shard_pp_moe_padding(positions)
+        if pp_group.is_first_rank:
             hidden_states = (
                 inputs_embeds
                 if inputs_embeds is not None
                 else self.embed_input_ids(input_ids)
             )
             residual = None
+            if self.use_sequence_parallel:
+                hidden_states = sequence_parallel_chunk(hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
         full_num_tokens = positions.shape[-1]
-        if self.use_sequence_parallel:
-            hidden_states = sequence_parallel_chunk(hidden_states)
-            assert residual is None
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
@@ -384,7 +396,7 @@ class InternS2MobiusModel(nn.Module, EagleModelMixin):
                 residual,
             )
 
-        if not get_pp_group().is_last_rank:
+        if not pp_group.is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )

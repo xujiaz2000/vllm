@@ -2078,13 +2078,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
             n = input_batch.num_tokens_after_padding
-            new_tensors = {
-                k: v[:n]
-                if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
-            }
-            model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+            shard_keys = getattr(self.model, "pp_token_shard_keys", ())
+            pp_inputs = self.intermediate_tensors.slice_for_pp(
+                n, shard_keys, self.parallel_config.tensor_parallel_size
+            )
+            if not dummy_run:
+                received = intermediate_tensors.tensors
+                for key, dst in pp_inputs.items():
+                    src = received[key]
+                    if key in shard_keys:
+                        if src.shape != dst.shape:
+                            raise ValueError(
+                                f"PP token shard {key!r} has shape {src.shape}, "
+                                f"expected {dst.shape}"
+                            )
+                    else:
+                        src = src[:n]
+                    dst.copy_(src)
+            model_inputs["intermediate_tensors"] = pp_inputs
             del intermediate_tensors
 
         # Update the EPLB meta.

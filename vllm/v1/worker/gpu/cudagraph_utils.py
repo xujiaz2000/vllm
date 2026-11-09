@@ -658,6 +658,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        self.pp_token_shard_keys: tuple[str, ...] = ()
 
     def capture(
         self,
@@ -675,6 +676,9 @@ class ModelCudaGraphManager(CudaGraphManager):
     ) -> None:
         """Capture CUDA graphs for model forward pass."""
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+        self.pp_token_shard_keys = shard_keys = getattr(
+            model, "pp_token_shard_keys", ()
+        )
         if self.use_breakable_cg:
             self.init_breakable_cg_runner(model)
 
@@ -695,8 +699,10 @@ class ModelCudaGraphManager(CudaGraphManager):
             default=0,
         )
 
-        def persistent_like(x: torch.Tensor) -> torch.Tensor:
-            return x.new_empty((max(max_tokens, x.shape[0]), *x.shape[1:]))
+        def persistent_like(
+            x: torch.Tensor, capacity: int = max_tokens
+        ) -> torch.Tensor:
+            return x.new_empty((max(capacity, x.shape[0]), *x.shape[1:]))
 
         def store_capture_output(num_tokens: int, model_output: Any) -> None:
             """Copy outputs to persistent buffers, allocating on first use."""
@@ -721,14 +727,26 @@ class ModelCudaGraphManager(CudaGraphManager):
                 assert isinstance(model_output, IntermediateTensors)
                 intermediate_tensors = model_output
                 if self.intermediate_tensors is None:
+                    max_shard_rows = cdiv(max_tokens, self.tp_size)
                     self.intermediate_tensors = IntermediateTensors(
                         {
-                            k: persistent_like(v)
+                            k: persistent_like(
+                                v, max_shard_rows if k in shard_keys else max_tokens
+                            )
                             for k, v in intermediate_tensors.tensors.items()
                         }
                     )
+                pp_outputs = self.intermediate_tensors.slice_for_pp(
+                    num_tokens, shard_keys, self.tp_size
+                )
                 for k, v in intermediate_tensors.tensors.items():
-                    self.intermediate_tensors[k][:num_tokens] = v
+                    dst = pp_outputs[k]
+                    if k in shard_keys and v.shape != dst.shape:
+                        raise ValueError(
+                            f"PP token shard {k!r} has shape {v.shape}, "
+                            f"expected {dst.shape}"
+                        )
+                    dst[:] = v
 
         def create_forward_fn(
             desc: BatchExecutionDescriptor, warmup: bool
@@ -758,7 +776,11 @@ class ModelCudaGraphManager(CudaGraphManager):
                     model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
-                model_inputs["intermediate_tensors"] = intermediate_tensors[:num_tokens]
+                model_inputs["intermediate_tensors"] = (
+                    intermediate_tensors.slice_for_pp(
+                        num_tokens, shard_keys, self.tp_size
+                    )
+                )
 
             if desc.num_ubatches > 1:
                 # Prepare and park threads before capture; finish runs inside it.
@@ -854,7 +876,9 @@ class ModelCudaGraphManager(CudaGraphManager):
         super().run_fullgraph(desc)
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
-            return self.intermediate_tensors[: desc.num_tokens]
+            return self.intermediate_tensors.slice_for_pp(
+                desc.num_tokens, self.pp_token_shard_keys, self.tp_size
+            )
 
         assert self.hidden_states is not None
         hidden_states = self.hidden_states[: desc.num_tokens]

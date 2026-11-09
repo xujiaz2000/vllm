@@ -39,6 +39,22 @@ class IntermediateTensors:
     def items(self):
         return self.tensors.items()
 
+    def slice_for_pp(
+        self, num_tokens: int, shard_keys: tuple[str, ...], tp_size: int
+    ) -> "IntermediateTensors":
+        """Return PP buffer views for full-token and rank-local payloads."""
+        if not shard_keys:
+            return self[:num_tokens]
+        shard_rows = (num_tokens + tp_size - 1) // tp_size
+        return IntermediateTensors(
+            {
+                key: tensor.narrow(0, 0, shard_rows)
+                if key in shard_keys
+                else tensor[:num_tokens]
+                for key, tensor in self.items()
+            }
+        )
+
     def __len__(self):
         return len(self.tensors)
 
